@@ -1,0 +1,1242 @@
+/* ============================================================
+   Vedruna Escorial Vic — notes.js
+   ============================================================ */
+
+/* --- Estat global --- */
+let notesItems   = [];
+let notesValors  = {};
+let noEntregats  = {};
+// Comentari de cada alumne sobre CADA activitat: { itemId: { posicio: text } }
+let notesComentaris = {};
+let notesContext = { materia: null, trimestre: null };
+
+/* --- Cua de guardament serial (evita pèrdues) --- */
+
+/* --- Cache local per assignatura+trimestre (TTL 10 min, persistent) --- */
+const _cache   = {};
+const CACHE_MS = 10 * 60 * 1000;
+function _cacheKey()        { return notesContext.materia + '_' + notesContext.trimestre + (notesContext.grup ? '_' + notesContext.grup : ''); }
+function _cachePersistKey() { return 'notescache_' + _cacheKey(); }
+function _cacheGet() {
+  let c = _cache[_cacheKey()];
+  if (!c) {
+    try {
+      const raw = localStorage.getItem(_cachePersistKey());
+      if (raw) { c = JSON.parse(raw); _cache[_cacheKey()] = c; }
+    } catch(e) {}
+  }
+  if (!c || Date.now() - c.ts > CACHE_MS) { _cacheDel(); return null; }
+  return c;
+}
+function _cacheSet(d) {
+  const entry = { ...d, ts: Date.now() };
+  _cache[_cacheKey()] = entry;
+  try { localStorage.setItem(_cachePersistKey(), JSON.stringify(entry)); } catch(e) {}
+}
+/* ⚠ CADA NOTA ESBORRAVA EL CACHE DE L'ASSIGNATURA (QA de rendiment, 16/9/2026).
+   Després d'entrar notes, tornar a obrir aquella assignatura ja no tenia res
+   per ensenyar de seguida: havia d'esperar el Google (~2 s) amb el vel a sobre.
+   Ara la nota s'escriu també al cache, a la fila del mateix NOM: la taula surt
+   a l'instant i el refresc de fons la posa al dia igualment. Si no es pot saber
+   de quina fila és (sense noms, un nom repetit, un alumne que encara no hi és),
+   es fa com abans i s'esborra: val més esperar que ensenyar-la al nen que no és. */
+function _notesCacheEscriu(itemId, studentId, canvi) {
+  let c = null;
+  try { c = _cacheGet(); } catch (e) {}
+  if (!c) return;
+  const st = students.find(x => x.id === studentId);
+  const norm = s => (s || '').toString().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const nom = st ? norm(st.nom) : '';
+  const files = (c.rowNoms || []).map(norm);
+  const pos = nom ? files.indexOf(nom) : -1;
+  if (pos < 0 || files.indexOf(nom, pos + 1) >= 0) { _cacheDel(); return; }
+  const valors = c.valors || {}, ne = c.noEntregats || {};
+  if (!valors[itemId]) valors[itemId] = {};
+  if (canvi.ne === true) { valors[itemId][pos] = 0; if (!ne[itemId]) ne[itemId] = {}; ne[itemId][pos] = true; }
+  else { valors[itemId][pos] = canvi.punts; if (ne[itemId]) delete ne[itemId][pos]; }
+  _cacheSet({ items: c.items || [], valors, noEntregats: ne, comentaris: c.comentaris || {}, rowNoms: c.rowNoms });
+}
+function _cacheDel() {
+  delete _cache[_cacheKey()];
+  try { localStorage.removeItem(_cachePersistKey()); } catch(e) {}
+}
+
+// Precarrega en segon pla les notes de TOTES les assignatures del trimestre actual.
+// Es desen al cache persistent perquè obrir qualsevol assignatura sigui instantani.
+async function prefetchAllNotes() {
+  if (!config.scriptUrl) return;
+  const MATS  = ['matematiques','catala','medi','musica','angles'];
+  const trim  = (typeof getTrimestreProposat === 'function') ? getTrimestreProposat() : 1;
+  // Carrega en sèrie suau (una rere l'altra) per no saturar Apps Script
+  for (const mat of MATS) {
+    const persistKey = 'notescache_' + mat + '_' + trim;
+    try {
+      // Si ja hi ha cache fresc, salta
+      const raw = localStorage.getItem(persistKey);
+      if (raw) {
+        const c = JSON.parse(raw);
+        if (c && Date.now() - c.ts < CACHE_MS) continue;
+      }
+      const r = await appsScriptGet({ action: 'getNotes', materia: mat, trimestre: trim });
+      if (r.ok) {
+        const entry = { items: r.items || [], valors: r.valors || {}, noEntregats: r.noEntregats || {}, comentaris: r.comentaris || {}, rowNoms: r.rowNoms || [], ts: Date.now() };
+        _cache[mat + '_' + trim] = entry;
+        localStorage.setItem(persistKey, JSON.stringify(entry));
+      }
+    } catch(e) { /* silent, es carregarà quan s'obri */ }
+  }
+}
+
+/* --- Qualificacions --- */
+const QUALS = [
+  { min: 0,   max: 4.99, codi: 'NA', bg: '#FEE2E2', color: '#991B1B' },
+  { min: 5,   max: 6.99, codi: 'AS', bg: '#FEF3C7', color: '#92400E' },
+  { min: 7,   max: 8.99, codi: 'AN', bg: '#DBEAFE', color: '#1E40AF' },
+  { min: 9,   max: 10,   codi: 'AE', bg: '#D1FAE5', color: '#065F46' },
+];
+function getQual(n)      { if (n === null || n === undefined || isNaN(n)) return null; for (const q of QUALS) if (n >= q.min && n <= q.max) return q; return QUALS[0]; }
+function getQualCodi(n)  { const q = getQual(n); return q ? q.codi : ''; }
+function sobre10(p, max) { if (!max || p === '' || p === null || p === undefined) return null; const n = parseFloat(p); return isNaN(n) ? null : Math.round(n / max * 10 * 100) / 100; }
+function arrod(mitj)     { return mitj === null || mitj === undefined ? null : Math.floor(mitj + 0.5); }
+
+/* --- Càlcul mitjana local --- */
+function calcMitjana(sid) {
+  let sumV = 0, sumP = 0;
+  for (const item of notesItems) {
+    const p = (notesValors[item.id] || {})[sid];
+    if (p === '' || p === null || p === undefined) continue;
+    const n = item.readonly ? parseFloat(p) : sobre10(p, item.maxPunts);
+    if (n === null || isNaN(n)) continue;
+    sumV += n * item.pes; sumP += item.pes;
+  }
+  return sumP === 0 ? null : Math.round(sumV / sumP * 100) / 100;
+}
+
+/* --- Ordre: Carpeta sempre al final --- */
+function sortCarpetaLast(items) {
+  const normal   = items.filter(i => !i.readonly && !i.isActitud);
+  const actitud  = items.filter(i => i.isActitud);
+  const carpeta  = items.filter(i => i.readonly && !i.isActitud);
+  return [...normal, ...actitud, ...carpeta];
+}
+
+/* ============================================================
+   COMENTARI D'UN ALUMNE SOBRE UNA ACTIVITAT
+   ------------------------------------------------------------
+   A part de la nota, el mestre pot deixar escrit com li ha anat aquella
+   activitat a aquell nen. Es desa com a nota de la mateixa cel·la del full
+   de càlcul, així també es veu obrint el Sheets.
+   ============================================================ */
+let _comNotaItem = null, _comNotaAlumne = null;
+
+function obreComentariNota(item, alumne) {
+  _comNotaItem = item; _comNotaAlumne = alumne;
+  let ov = document.getElementById('comNotaOverlay');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.className = 'modal-overlay';
+    ov.id = 'comNotaOverlay';
+    ov.addEventListener('mousedown', e => { if (e.target === ov) ov.classList.remove('open'); });
+    ov.innerHTML =
+      '<div class="modal">' +
+        '<div class="modal-header">' +
+          '<div><div class="modal-header-title" id="comNotaTitol"></div>' +
+          '<div class="modal-header-sub" id="comNotaSub"></div></div>' +
+          '<button class="modal-close" id="comNotaX" aria-label="Tancar">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>' +
+        '</div>' +
+        '<div class="modal-body">' +
+          '<div class="modal-field">' +
+            '<div class="modal-label">Com li ha anat aquesta activitat</div>' +
+            '<textarea class="modal-input" id="comNotaText" rows="5" ' +
+              'placeholder="Ex: Ha entès el procediment però s\'ha encallat amb els problemes llargs."></textarea>' +
+            '<div class="modal-hint">Ho veuràs també obrint el full de càlcul, al costat de la nota.</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="modal-footer">' +
+          '<button class="btn btn-ghost" id="comNotaEsb">Esborrar</button>' +
+          '<button class="btn btn-secondary" id="comNotaCancel">Cancel·lar</button>' +
+          '<button class="btn btn-primary" id="comNotaDesa">Desar</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(ov);
+    document.getElementById('comNotaX').addEventListener('click', () => ov.classList.remove('open'));
+    document.getElementById('comNotaCancel').addEventListener('click', () => ov.classList.remove('open'));
+    document.getElementById('comNotaDesa').addEventListener('click', () => desaComentariNota(document.getElementById('comNotaText').value));
+    document.getElementById('comNotaEsb').addEventListener('click', () => desaComentariNota(''));
+    document.getElementById('comNotaText').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && e.ctrlKey) desaComentariNota(document.getElementById('comNotaText').value);
+    });
+  }
+  document.getElementById('comNotaTitol').textContent = alumne.nom;
+  document.getElementById('comNotaSub').textContent   = item.nom;
+  document.getElementById('comNotaText').value = (notesComentaris[item.id] || {})[alumne.id] || '';
+  ov.classList.add('open');
+  setTimeout(() => document.getElementById('comNotaText').focus(), 80);
+}
+
+async function desaComentariNota(text) {
+  const item = _comNotaItem, alumne = _comNotaAlumne;
+  if (!item || !alumne) return;
+  const net = (text || '').trim();
+
+  // Pinta-ho de seguida (sense esperar el servidor)
+  if (!notesComentaris[item.id]) notesComentaris[item.id] = {};
+  if (net) notesComentaris[item.id][alumne.id] = net;
+  else delete notesComentaris[item.id][alumne.id];
+  document.getElementById('comNotaOverlay').classList.remove('open');
+  renderNotesTable();
+  _cacheDel();   // el cache ja no val: es tornarà a portar del full
+
+  if (!config.scriptUrl) return;
+  /* ⚠ ERA L'ÚNICA CASELLA DE NOTES QUE ES PODIA PERDRE (auditoria del 27/9/2026).
+     Anava a pèl: si el servidor no hi era, sortia un avís i el comentari només
+     quedava a la memòria; el refresc següent el treia de la pantalla i al full
+     no hi havia arribat mai. Ara va per la cua de pendents —la mateixa de la
+     fitxa i el planning—: es reintenta sol i sobreviu a tancar l'app. */
+  const r = await _desaAlFull({
+    action: 'saveNotaComentari',
+    materia: notesContext.materia, trimestre: notesContext.trimestre,
+    grup: notesContext.grup || '', itemId: item.id,
+    nom: alumne.nom, text: net
+  }, { callat: true });
+  if (r && r._pendent) {
+    showToast('El comentari encara no ha arribat al full: ho torno a provar sol.', 'error');
+  } else if (r && r.ok === false) {
+    showToast('No s\'ha pogut desar el comentari: ' + (r.error || ''), 'error');
+  } else {
+    showToast(net ? 'Comentari desat ✓' : 'Comentari esborrat', 'success');
+  }
+}
+
+/* ============================================================
+   TRIMESTRE AUTOMÀTIC
+   ============================================================ */
+function getTrimestreActual() {
+  const d = new Date(), m = d.getMonth() + 1, dia = d.getDate();
+  if ((m === 6 && dia >= 24) || m === 7 || m === 8) return null; // fora de curs
+  if (m >= 9 && m <= 12) return 1;
+  if (m === 1 && dia <= 7) return 1;
+  if ((m === 1 && dia >= 8) || m === 2 || (m === 3 && dia <= 29)) return 2;
+  return 3;
+}
+/* ⚠ AL JULIOL TOT CAIA AL PRIMER TRIMESTRE.
+
+   Trobat a l'auditoria del 6/9/2026. Del 24 de juny al 31 d'agost
+   `getTrimestreActual()` torna `null` —i està bé, perquè no hi ha classe—,
+   però tots els llocs que en necessiten un feien `|| 1`. Resultat: al juliol,
+   quan la mestra repassa el curs que acaba de tancar, l'app li obria el
+   PRIMER trimestre. I si hi escrivia, ho escrivia al trimestre que no era.
+
+   `getTrimestreProposat()` no torna mai buit i proposa el que té sentit:
+   fins al 31 de juliol, el 3r —el que s'acaba de tancar, que és el que es
+   repassa—; des de l'1 d'agost, el 1r, que és el que ve. */
+function getTrimestreProposat() {
+  const t = getTrimestreActual();
+  if (t) return t;
+  const d = new Date(), m = d.getMonth() + 1;
+  return (m === 6 || m === 7) ? 3 : 1;
+}
+function getTrimLabel(t) { return ['','1r Trimestre','2n Trimestre','3r Trimestre'][t] || ''; }
+
+function trimAlertSuprimida() {
+  const v = localStorage.getItem('trimAlertSup');
+  return v && Date.now() < parseInt(v);
+}
+function suprimeixTrimAlert() {
+  localStorage.setItem('trimAlertSup', String(Date.now() + 60 * 60 * 1000));
+}
+
+function showTrimAlert(trimActual, trimSel) {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('trimAlertOverlay');
+    document.getElementById('trimAlertMsg').innerHTML =
+      `Estàs editant el <strong>${getTrimLabel(trimSel)}</strong> però ara estem al <strong>${getTrimLabel(trimActual)}</strong>.<br><br>Vols continuar editant el ${getTrimLabel(trimSel)}?`;
+    const cb = document.getElementById('trimAlertNoMostrar');
+    if (cb) cb.checked = false;
+    overlay.classList.add('open');
+    ['trimAlertSi','trimAlertNo'].forEach(id => {
+      const old = document.getElementById(id);
+      const neu = old.cloneNode(true);
+      old.parentNode.replaceChild(neu, old);
+      neu.addEventListener('click', () => {
+        overlay.classList.remove('open');
+        if (id === 'trimAlertSi' && cb && cb.checked) suprimeixTrimAlert();
+        resolve(id === 'trimAlertSi');
+      });
+    });
+  });
+}
+
+/* ============================================================
+   OBRIR NOTES
+   ============================================================ */
+async function openNotesAuto(materia, grup) {
+  /* ⚠ A L ESTIU PORTAVA AL 1r TRIMESTRE.
+
+     Segona auditoria (8/9/2026). De finals de juny a l agost
+     `getTrimestreActual()` torna null —no hi ha cap trimestre obert— i aqui
+     es queia al 1r, que es el que ja s ha tancat feia mig any. L arranjament
+     del 6/9 va treure aquest «|| 1» de la resta de llocs i aquest es va
+     quedar. `getTrimestreProposat()` ja sap contestar-ho be: fora de curs
+     proposa el que toca. */
+  const t = (typeof getTrimestreProposat === 'function')
+    ? getTrimestreProposat()
+    : (getTrimestreActual() !== null ? getTrimestreActual() : 1);
+  openNotes(materia, t, grup);
+}
+
+/* ⚠ LES NOTES DE TALLERS NO SORTIEN (en Pol, 16/9/2026).
+
+   «La setmana passada vaig entrar notes a Tallers de 3r. Al full de càlcul
+   em queden ben entrades, però a l'app no es mostren.» Les notes es casen
+   per NOM amb la llista d'alumnes de la pantalla. Amb una assignatura d'un
+   altre grup (Tallers, Anglès de 3r A…) aquesta llista arriba per un camí
+   més lent que les notes. Si les notes arribaven primer, es casaven amb la
+   llista d'ABANS —la tutoria— i no n'encaixava cap; quan després arribava la
+   llista bona, només es tornava a pintar, sense tornar-les a casar. La
+   pantalla quedava en blanc amb les notes ben desades al full.
+
+   Ara el context de les notes porta la promesa de la llista: la càrrega de
+   notes l'espera abans de casar-les, i quan la llista arriba es tornen a
+   casar les que ja hi havia a la memòria. */
+function _esperaAlumnes(promesa) {
+  const ctx = notesContext;
+  ctx.alumnesPendents = true;
+  ctx.alumnes = Promise.resolve(promesa).catch(() => {}).then(() => {
+    if (notesContext !== ctx) return;
+    ctx.alumnesPendents = false;
+    try {
+      const c = _cacheGet();
+      if (c) {
+        notesItems  = sortCarpetaLast(c.items || []);
+        notesValors = c.rowNoms ? _remapValorsPerNom(c.valors || {}, c.rowNoms) : (c.valors || {});
+        noEntregats = c.rowNoms ? _remapValorsPerNom(c.noEntregats || {}, c.rowNoms) : (c.noEntregats || {});
+        notesComentaris = c.rowNoms ? _remapValorsPerNom(c.comentaris || {}, c.rowNoms) : (c.comentaris || {});
+        _injectActitudItem(ctx.materia, parseInt(ctx.trimestre));
+      }
+    } catch (e) {}
+    if (typeof renderNotesTable === 'function') { try { renderNotesTable(); } catch (e) {} }
+  });
+  return ctx.alumnes;
+}
+
+async function openNotes(materia, trimestre, grup) {
+  const trimActual = getTrimestreActual();
+  if (trimActual !== null && parseInt(trimestre) !== trimActual && !trimAlertSuprimida()) {
+    const ok = await showTrimAlert(trimActual, parseInt(trimestre));
+    if (!ok) { openNotes(materia, trimActual, grup); return; }
+  }
+
+  // Desdoblament rotatori (p. ex. Tallers 3r): grup actual, barrejant classes
+  const dd = (typeof _assigDesdobMap !== 'undefined') ? _assigDesdobMap[materia] : null;
+  notesContext = { materia, trimestre, grup: dd ? null : (grup || notesContext.grup || null), desdob: dd || null };
+
+  // La casella de compartir amb el tutor: és per assignatura+grup
+  if (typeof initCompartirNotes === 'function') { try { initCompartirNotes(); } catch (e) {} }
+
+  /* Els botons de trimestre hi són SEMPRE, també a Tallers. Abans s'amagaven
+     a les assignatures rotatòries, però les notes es desen per trimestre igual:
+     al gener l'app hauria obert el 2n trimestre i no hi hauria hagut manera de
+     tornar a les del 1r. En Pol, 16/9/2026: «vull continuar podent triar el trimestre». */
+  const _trimSel = document.getElementById('notesTrimSelector');
+  if (_trimSel) _trimSel.style.display = 'flex';
+
+  if (dd && typeof _loadDesdobStudents === 'function') {
+    if (typeof _renderDesdobControl === 'function') {
+      _renderDesdobControl('notesDesdobBar', dd, () => {
+        if (typeof _grupStudentsCarregat !== 'undefined') _grupStudentsCarregat = null;
+        // El nou grup té altres alumnes: cal re-remapejar les notes pel nom, si no
+        // surten en blanc. Pintem del cache a l'instant i refresquem en segon pla.
+        _esperaAlumnes(_loadDesdobStudents(dd.curs, dd.assig));
+        if (typeof _loadNotesBackground === 'function') _loadNotesBackground();
+      });
+    }
+    _esperaAlumnes(_loadDesdobStudents(dd.curs, dd.assig));
+  } else if (notesContext.grup && typeof _ensureGrupStudents === 'function') {
+    // Assignatura d'un grup concret: carrega'n els alumnes en segon pla (amb cache).
+    const _nb = document.getElementById('notesDesdobBar'); if (_nb) _nb.innerHTML = '';
+    _esperaAlumnes(_ensureGrupStudents(notesContext.grup, materia));
+  } else {
+    // Assignatura de tutoria: assegura't que els alumnes actius són els del grup propi.
+    const _nb = document.getElementById('notesDesdobBar'); if (_nb) _nb.innerHTML = '';
+    if (typeof _restoreTutoriaStudents === 'function') { try { _restoreTutoriaStudents(); } catch(e) {} }
+  }
+
+  // Aplica cache immediatament (zero delay visual)
+  const cached = _cacheGet();
+  if (cached) {
+    notesItems  = sortCarpetaLast(cached.items || []);
+    // Remapa pel nom si el cache porta rowNoms (evita desalineació)
+    notesValors = cached.rowNoms ? _remapValorsPerNom(cached.valors || {}, cached.rowNoms) : (cached.valors || {});
+    noEntregats = cached.rowNoms ? _remapValorsPerNom(cached.noEntregats || {}, cached.rowNoms) : (cached.noEntregats || {});
+    notesComentaris = cached.rowNoms ? _remapValorsPerNom(cached.comentaris || {}, cached.rowNoms) : (cached.comentaris || {});
+  } else {
+    notesItems = []; notesValors = {}; noEntregats = {}; notesComentaris = {};
+  }
+  // Injecta l'ítem d'actitud (sempre present, entre Carpeta i Mitjana)
+  _injectActitudItem(materia, parseInt(trimestre));
+
+  // Navega immediatament
+  showPage('notes');
+  _updateNotesHeader(materia, trimestre);
+
+  if (cached) {
+    // Tenim dades en cache → renderitza immediatament
+    renderNotesTable();
+    // Refresca en segon pla silenciosament
+    _loadNotesBackground();
+  } else {
+    // Sense cache → mostra spinner mentre carrega
+    _showNotesLoading();
+    _loadNotesBackground();
+  }
+}
+
+function _updateNotesHeader(materia, trimestre) {
+  /* ⚠ EL GRUP SORTIA DUES VEGADES.
+
+     Trobat a l auditoria del 6/9/2026: l etiqueta d una assignatura del perfil
+     ja porta el grup a dins («Angles · 3r A») i aqui se n hi tornava a
+     enganxar un altre: «Angles · 3r A · 3r A». Ara nomes s hi posa si no hi es. */
+  const _base = (MATERIES[materia] || materia);
+  const _g = notesContext.grup || '';
+  const grupSufix = (_g && _base.indexOf(_g) === -1) ? ' · ' + _g : '';
+  document.getElementById('notesTitle').textContent     = _base + grupSufix;
+  document.getElementById('notesTrimLabel').textContent = TRIM_LABELS[String(trimestre)];
+  const backBtn = document.getElementById('notesBackBtn');
+  if (backBtn) backBtn.onclick = () => showPage('home');
+  const trimSel = document.getElementById('notesTrimSelector');
+  if (trimSel) {
+    trimSel.style.display = 'flex';
+    trimSel.querySelectorAll('.trim-sel-btn').forEach(b => {
+      b.classList.toggle('active', String(b.dataset.trim) === String(trimestre));
+    });
+  }
+}
+
+// Remapa valors indexats per posició-al-full a indexats per studentId,
+// usant el nom de cada fila (rowNoms) per casar amb students.
+function _remapValorsPerNom(valors, rowNoms) {
+  // Si no tenim rowNoms (compatibilitat), retorna tal qual
+  if (!rowNoms || !rowNoms.length || !students || !students.length) return valors;
+  // Mapa: posició al full → studentId (pel nom)
+  const _norm = s => (s||'').toString().normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/\s+/g,' ').trim();
+  const posToId = {};
+  const usats = {};
+  rowNoms.forEach((nom, pos) => {
+    const n = _norm(nom);
+    if (!n) return;
+    // Primer alumne SENSE assignar amb aquest nom → desambigua noms duplicats
+    // (dos "Marc Puig"): cada posició casa amb un alumne diferent, no el mateix.
+    const st = students.find(s => !usats[s.id] && _norm(s.nom) === n);
+    if (st) { posToId[pos] = st.id; usats[st.id] = true; }
+  });
+  /* ⚠ UNA FILA DEL FULL QUE NO CASA AMB CAP ALUMNE ATERRAVA SOBRE UN ALTRE NEN.
+
+     Trobat a la segona auditoria (8/9/2026). Aquí, si un nom del full no era
+     a la llista d'ara, es deixava la POSICIÓ com a clau. Però els studentId
+     TAMBÉ són posicions (0, 1, 2…), o sigui que aquella clau òrfena queia
+     just damunt de l'alumne que ara ocupa aquell número: o bé la nota sortia
+     a un altre nen, o bé el valor buit d'aquell nen se la menjava i
+     desapareixia de la pantalla. Passa quan la secretaria corregeix un nom
+     al full «Grups» a mig curs —un accent, un segon cognom—, que és una cosa
+     normal i que ningú no avisa a la mestra.
+
+     Ara una fila que no casa amb ningú es queda fora, i es diu de qui és. La
+     nota no s'ha perdut: continua al full sota el nom vell. */
+  const out = {};
+  const orfes = {};
+  Object.keys(valors).forEach(itemId => {
+    out[itemId] = {};
+    Object.keys(valors[itemId]).forEach(pos => {
+      const id = posToId[pos];
+      if (id === undefined) {
+        const nomFull = (rowNoms[pos] || '').toString().trim();
+        if (nomFull) orfes[nomFull] = true;
+        return;
+      }
+      out[itemId][id] = valors[itemId][pos];
+    });
+  });
+  const noms = Object.keys(orfes);
+  // Amb la llista d'alumnes encara de camí, no casar és normal: no és cap avís.
+  const llistaAPunt = !(typeof notesContext !== 'undefined' && notesContext && notesContext.alumnesPendents);
+  if (noms.length && llistaAPunt && !_remapAvisat) {
+    _remapAvisat = true;
+    setTimeout(() => {
+      try {
+        showToast('Al full hi ha notes de ' + noms.slice(0, 3).join(', ') +
+                  (noms.length > 3 ? ' i ' + (noms.length - 3) + ' més' : '') +
+                  ', que ara no són a la teva llista. Potser els han canviat el nom al full de ' +
+                  'l\'escola. Les notes hi continuen; aquí no te les puc ensenyar fins que els ' +
+                  'noms coincideixin.', 'error');
+      } catch (e) {}
+    }, 1200);
+  }
+  return out;
+}
+/* Un sol avís per sessió: si un nom no casa, no casarà en tot el dia i
+   repetir-ho a cada assignatura només faria nosa. */
+let _remapAvisat = false;
+
+function _notesEsVeuen() {
+  const w = document.getElementById('notesTableWrap');
+  return !!(w && w.style.display !== 'none' && notesItems && notesItems.length);
+}
+
+async function _loadNotesBackground() {
+  if (!config.scriptUrl) return;
+  const ctx = notesContext;
+  try {
+    const r = await appsScriptGet({
+      action: 'getNotes',
+      materia: ctx.materia,
+      grup: ctx.grup,
+      trimestre: ctx.trimestre,
+      /* Si la taula ja es veu (del cache), el refresc no la tapa amb el vel:
+         la mestra pot començar a escriure mentre arriba. */
+      _fons: _notesEsVeuen(),
+    });
+    if (!r.ok) throw new Error(r.error);
+    /* Les notes es casen per NOM amb la llista d'alumnes. Si aquesta llista
+       encara no ha arribat (Tallers, una assignatura d'un altre grup), s'ha
+       d'esperar: casar-les amb la d'abans les deixava totes en blanc. */
+    if (ctx.alumnes) { try { await ctx.alumnes; } catch (e) {} }
+    // Mentre s'esperava, la mestra ha obert una altra cosa: això ja no toca.
+    if (notesContext !== ctx) return;
+    const newItems  = sortCarpetaLast(r.items || []);
+    // Guarda al cache els valors ORIGINALS (per posició) + rowNoms.
+    // El remapatge per nom es fa en aplicar (aquí sota i en obrir des de cache).
+    _cacheSet({ items: r.items || [], valors: r.valors || {}, noEntregats: r.noEntregats || {}, comentaris: r.comentaris || {}, rowNoms: r.rowNoms || [] });
+    // Per a l'ús immediat, remapa pel nom
+    const newValors = _remapValorsPerNom(r.valors || {}, r.rowNoms);
+    const newNE     = _remapValorsPerNom(r.noEntregats || {}, r.rowNoms);
+    const newComs   = _remapValorsPerNom(r.comentaris || {}, r.rowNoms);
+
+    // Detecta canvis abans de sobreescriure (evita re-render innecessari).
+    // Compara només les dades del servidor (l'actitud ve del localStorage).
+    const prevItemsServer  = notesItems.filter(i => i.id !== 'actitud_ref');
+    const prevValorsServer = {};
+    Object.keys(notesValors).forEach(k => { if (k !== 'actitud_ref') prevValorsServer[k] = notesValors[k]; });
+    const changed = JSON.stringify(newItems)  !== JSON.stringify(prevItemsServer) ||
+                    JSON.stringify(newValors) !== JSON.stringify(prevValorsServer);
+
+    notesItems  = newItems;
+    notesValors = newValors;
+    noEntregats = newNE;
+    notesComentaris = newComs;
+    // Actitud ve del localStorage (no del servidor): re-injecta sempre
+    _injectActitudItem(notesContext.materia, parseInt(notesContext.trimestre));
+    if (changed) renderNotesTable();
+    _hideNotesLoading();
+    updateSync('ok', 'Sincronitzat'); updateStatSync();
+  } catch (e) {
+    _hideNotesLoading();
+    updateSync('error', 'Error');
+    showToast('Error carregant notes: ' + (typeof errorHuma === 'function' ? errorHuma(e) : (e && e.message) || ''), 'error');
+  }
+}
+
+async function syncNotes() { _cacheDel(); _showNotesLoading(); await _loadNotesBackground(); }
+
+function _showNotesLoading() {
+  const empty = document.getElementById('notesEmpty');
+  const wrap  = document.getElementById('notesTableWrap');
+  if (empty) {
+    empty.innerHTML = `
+      <div class="notes-loading-spinner"></div>
+      <p>Carregant notes…</p>`;
+    empty.style.display = 'block';
+  }
+  if (wrap) wrap.style.display = 'none';
+}
+
+function _hideNotesLoading() {
+  // Si el contingut del empty és el spinner, el restaura al missatge original
+  const empty = document.getElementById('notesEmpty');
+  if (empty && empty.querySelector('.notes-loading-spinner')) {
+    empty.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>
+      <p>Cap ítem de notes. Clica <strong>Nou ítem</strong> per afegir la primera prova o activitat.</p>`;
+  }
+}
+
+/* ============================================================
+   MODAL — Nou ítem
+   ============================================================ */
+function openNewNotaModal() {
+  document.getElementById('notaItemNom').value = '';
+  document.getElementById('notaItemMax').value = '10';
+  selectPesByVal('1');
+  document.getElementById('newNotaOverlay').classList.add('open');
+  setTimeout(() => document.getElementById('notaItemNom').focus(), 100);
+}
+function closeNewNotaModal() { document.getElementById('newNotaOverlay').classList.remove('open'); }
+
+function selectPes(btn) {
+  document.querySelectorAll('.pes-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('notaItemPes').value = btn.dataset.val;
+}
+function selectPesByVal(val) {
+  document.querySelectorAll('.pes-btn').forEach(b => b.classList.toggle('active', b.dataset.val === val));
+  document.getElementById('notaItemPes').value = val;
+}
+
+async function addNotaItem() {
+  const nom      = document.getElementById('notaItemNom').value.trim();
+  /* ⚠ Abans, un 0 o un negatiu es convertien en 10 sense dir res (el
+     `|| 10` s empassa el zero), i la mestra es trobava una activitat sobre
+     10 quan n havia demanat una altra cosa (auditoria 6/9/2026). */
+  const _maxCru = document.getElementById('notaItemMax').value.trim();
+  const _pesCru = document.getElementById('notaItemPes').value.trim();
+  const maxPunts = _maxCru === '' ? 10 : parseFloat(_maxCru);
+  const pes      = _pesCru === '' ? 1  : parseFloat(_pesCru);
+  if (!nom) { showToast('Posa-li un nom a l activitat', 'error'); document.getElementById('notaItemNom').focus(); return; }
+  /* ⚠ DUES ACTIVITATS AMB EL MATEIX NOM.
+
+     Segona auditoria (8/9/2026): al registre d'aula això ja es bloqueja des
+     de l'auditoria anterior i aquí no s'hi va portar. Dues columnes «Prova»
+     i cap manera de saber quina és quina —ni a la pantalla ni al full. */
+  if (notesItems.some(i => (i.nom || '').trim().toLowerCase() === nom.toLowerCase())) {
+    showToast('Ja hi ha una activitat que es diu «' + nom + '». Posa-li un altre nom.', 'error');
+    document.getElementById('notaItemNom').focus();
+    return;
+  }
+  if (isNaN(maxPunts) || maxPunts <= 0) {
+    showToast('La puntuació màxima ha de ser un número més gran que zero', 'error');
+    document.getElementById('notaItemMax').focus(); return;
+  }
+  if (isNaN(pes) || pes <= 0) {
+    showToast('El pes ha de ser un número més gran que zero', 'error');
+    document.getElementById('notaItemPes').focus(); return;
+  }
+  const item = { id: Date.now(), nom, maxPunts, pes };
+  notesItems.push(item);
+  notesValors[item.id] = {};
+  notesItems = sortCarpetaLast(notesItems);
+  _cacheDel();
+  closeNewNotaModal();
+  renderNotesTable();
+  if (!config.scriptUrl) return;
+  /* ⚠ ABANS AQUÍ S'ESPERAVA EL SERVIDOR AMB LA PANTALLA ATURADA.
+
+     En Pol, 26/9/2026: crear una activitat trigava molt, sortia l'error de
+     temps, la columna es treia de la taula… i quan tornava a clicar se'n
+     creava una SEGONA al full (la primera sí que hi havia arribat). Ara la
+     columna es queda a la taula i la petició va a la cua: es reintenta sola
+     amb el mateix codi i el servidor no en pot fer dues. La mestra pot
+     començar a posar-hi notes de seguida: van darrere de la columna a la
+     mateixa cua, o sigui que arriben al full després d'ella. */
+  _casellesPosa('notesItem', _notesCtxCua(), 'columna|' + item.id,
+                { item, alumnes: students.map(s => ({ id: s.id, nom: s.nom })) });
+  showToast('Ítem «' + nom + '» creat', 'success');
+}
+
+/* Igual que al registre d aula: el codi arriba com a text i es compara amb
+   String(), perque els codis d ara son numeros pero l item d actitud i el de
+   la Carpeta ja tenen codis de lletres (8/9/2026). */
+async function deleteNotaItem(itemId) {
+  const item = notesItems.find(i => String(i.id) === String(itemId));
+  if (!item || !confirm('Eliminar «' + item.nom + '» i totes les seves notes?')) return;
+  itemId = item.id;
+  notesItems = notesItems.filter(i => String(i.id) !== String(itemId));
+  delete notesValors[itemId];
+  // Les notes d'aquesta columna que encara viatjaven ja no tenen on anar.
+  _caselles = _caselles.filter(x => !(x.tipus === 'notes' && String(x.canvi.itemId) === String(itemId)));
+  _casellesGuarda();
+  _cacheDel();
+  renderNotesTable();
+  if (!config.scriptUrl) return;
+  // Com crear-la: a la cua, i es reintenta sol si el servidor no hi és ara.
+  _casellesPosa('notesItemFora', _notesCtxCua(), 'columnaFora|' + itemId, { itemId });
+  showToast('Ítem eliminat', 'success');
+}
+
+/* El servidor ha confirmat la columna. Si al full ja n'hi havia una amb aquest
+   nom (un intent perdut), ve amb un altre codi: les notes que ja hi ha a la
+   pantalla passen a ser d'aquella columna, i així no se'n fa cap de bessona. */
+window._notesItemConfirmat = function (ctx, idVell, idNou) {
+  const meu = _notesCtxCua();
+  if (!ctx || ctx.materia !== meu.materia || String(ctx.trimestre) !== String(meu.trimestre) ||
+      (ctx.grup || null) !== (meu.grup || null)) return;
+  if (String(idVell) !== String(idNou)) {
+    const it = notesItems.find(i => String(i.id) === String(idVell));
+    if (it) it.id = idNou;
+    [notesValors, noEntregats, notesComentaris].forEach(m => {
+      if (m && m[idVell] !== undefined) { m[idNou] = m[idVell]; delete m[idVell]; }
+    });
+  }
+  _cacheDel();
+  renderNotesTable();
+  _loadNotesBackground();     // el cache torna a ser bo, en segon pla
+};
+
+/* ============================================================
+   ACTUALITZAR NOTA — cua serial, sense pèrdues
+   ============================================================ */
+async function updateNota(itemId, studentId, punts) {
+  if (!notesValors[itemId]) notesValors[itemId] = {};
+  notesValors[itemId][studentId] = punts;
+  refreshStudentRow(studentId);
+  _notesCacheEscriu(itemId, studentId, { punts });
+  if (typeof _notesResumCache !== 'undefined') _notesResumCache = null; // invalida resum fitxa
+  if (typeof _notesResumMats !== 'undefined') _notesResumMats = null;
+  if (!config.scriptUrl) return;
+  const _st = students.find(x => x.id === studentId);
+  const _nom = _st ? _st.nom : '';
+  /* A la cua de caselles (app.js): surt en segon pla, agrupada amb les notes
+     del costat, i no es perd si falla. Abans era una crida per nota, amb vel,
+     i si fallava només sortia «Error guardant» (QA de rendiment, 16/9/2026).
+     Si aquella casella venia de treure un NE, s'hi manté la marca: el servidor
+     ha de saber que el buit és de debò i no un rebot. */
+  const ctx = _notesCtxCua();
+  const clau = itemId + '|' + (_nom || studentId);
+  const abans = _casellesDe('notes', ctx).find(e => e.clau.endsWith('|' + clau));
+  const canvi = { itemId, studentId, nom: _nom, punts };
+  if (abans && abans.canvi.ne === false) canvi.ne = false;
+  _casellesPosa('notes', ctx, clau, canvi);
+}
+
+/* De quin full són les notes que es desen ara. El trimestre sempre com a
+   text: de vegades arriba com a número i de vegades com a text, i dues
+   claus diferents per al mateix full partirien les notes en dos viatges. */
+function _notesCtxCua() {
+  return { materia: notesContext.materia, trimestre: String(notesContext.trimestre),
+           grup: notesContext.grup || null };
+}
+
+/* El que hi ha apuntat i encara no ha arribat al full, a sobre del que ve del
+   servidor. Sense això, el refresc de fons esborrava de la pantalla notes
+   que la mestra acabava d'escriure. Es casa pel NOM: si la llista s'ha
+   reordenat, el número ja no seria el mateix nen. */
+function _notesAmbPendents() {
+  if (typeof _casellesDe !== 'function' || !notesContext || !notesContext.materia) return;
+  _casellesDe('notes', _notesCtxCua()).forEach(e => {
+    const c = e.canvi;
+    const st = c.nom ? students.find(s => s.nom === c.nom) : null;
+    const id = st ? st.id : c.studentId;
+    if (!notesValors[c.itemId]) notesValors[c.itemId] = {};
+    if (!noEntregats[c.itemId]) noEntregats[c.itemId] = {};
+    if (c.ne === true) { noEntregats[c.itemId][id] = true; notesValors[c.itemId][id] = 0; }
+    else {
+      if (c.ne === false) noEntregats[c.itemId][id] = false;
+      notesValors[c.itemId][id] = c.punts;
+    }
+  });
+}
+
+/* ============================================================
+   NO ENTREGAT
+   ============================================================ */
+async function toggleNoEntregat(item, studentId, inp, chip) {
+  if (!noEntregats[item.id]) noEntregats[item.id] = {};
+  const era = noEntregats[item.id][studentId] === true;
+  const isNE = !era;
+  noEntregats[item.id][studentId] = isNE;
+
+  // Botó: cerca des del td (és fill directe de td, fora de inner)
+  const btnNE = chip.closest('td').querySelector('.ne-btn');
+  if (btnNE) {
+    btnNE.classList.toggle('ne-active', isNE);
+    btnNE.title = isNE ? 'Marcat com a No Entregat. Clica per desfer.' : 'Marcar com a No Entregat';
+  }
+  inp.disabled     = isNE;
+  inp.placeholder  = isNE ? 'NE' : '—';
+  inp.style.opacity = isNE ? '0.4' : '1';
+  if (isNE) inp.value = '';
+
+  if (isNE) {
+    chip.textContent = '0.00'; chip.style.background = '#FEE2E2'; chip.style.color = '#991B1B';
+    // Actualitza l'estat local com si fos 0 (per al càlcul de mitjana local)
+    if (!notesValors[item.id]) notesValors[item.id] = {};
+    notesValors[item.id][studentId] = 0;
+  } else {
+    chip.textContent = '—'; chip.style.background = 'transparent'; chip.style.color = 'var(--text-muted)';
+    if (!notesValors[item.id]) notesValors[item.id] = {};
+    notesValors[item.id][studentId] = '';
+  }
+  refreshStudentRow(studentId);
+  _notesCacheEscriu(item.id, studentId, isNE ? { ne: true } : { punts: '' });
+
+  // A la cua de caselles, com les notes. Marcar NE deixa la casella en «NE»;
+  // treure'l la deixa buida de debò (`ne:false` + buit).
+  if (config.scriptUrl) {
+    const _stNE = students.find(x => x.id === studentId);
+    const _nomNE = _stNE ? _stNE.nom : '';
+    const canvi = isNE ? { itemId: item.id, studentId, nom: _nomNE, ne: true }
+                       : { itemId: item.id, studentId, nom: _nomNE, ne: false, punts: '' };
+    _casellesPosa('notes', _notesCtxCua(), item.id + '|' + (_nomNE || studentId), canvi);
+  }
+}
+
+/* ============================================================
+   REFRESCA UNA FILA (després d'entrar nota)
+   ============================================================ */
+function refreshStudentRow(sid) {
+  for (const item of notesItems) {
+    const chip = document.getElementById('c_' + item.id + '_' + sid);
+    if (!chip) continue;
+    const p = (notesValors[item.id] || {})[sid];
+    const isNE = !item.readonly && (noEntregats[item.id] || {})[sid] === true;
+    if (isNE) { chip.textContent = '0.00'; chip.style.background = '#FEE2E2'; chip.style.color = '#991B1B'; continue; }
+    const n = item.readonly ? (p !== '' && p !== null && p !== undefined ? parseFloat(p) : null) : sobre10(p, item.maxPunts);
+    const q = n !== null ? getQual(n) : null;
+    chip.textContent      = n !== null ? n.toFixed(2) : '—';
+    chip.style.background = q ? q.bg    : (item.readonly ? 'var(--surface-alt)' : 'transparent');
+    chip.style.color      = q ? q.color : 'var(--text-muted)';
+  }
+  const mitj = calcMitjana(sid);
+  const mCell = document.getElementById('mitj_' + sid);
+  if (mCell) {
+    const qM = mitj !== null ? getQual(mitj) : null;
+    mCell.innerHTML = mitj !== null
+      ? `<span class="nota10-chip" style="background:${qM?qM.bg:'var(--surface-alt)'};color:${qM?qM.color:'var(--text-sub)'};font-size:15px;font-weight:700">${mitj.toFixed(2)}</span>`
+      : '<span style="color:var(--text-muted)">—</span>';
+  }
+  const nCell = document.getElementById('nota_' + sid);
+  if (nCell) {
+    const nota = arrod(mitj);
+    if (nota !== null) {
+      const isSus = nota < 5;
+      const bgN = isSus ? '#FEE2E2' : '#D1FAE5';
+      const fcN = isSus ? '#991B1B' : '#065F46';
+      nCell.innerHTML = `<span class="nota10-chip" style="background:${bgN};color:${fcN};font-size:16px;font-weight:800;min-width:44px">${nota}</span><span class="qual-badge" style="background:${bgN};color:${fcN};font-size:11px">${getQualCodi(nota)}</span>`;
+    } else { nCell.innerHTML = '<span style="color:var(--text-muted)">—</span>'; }
+  }
+}
+
+/* ============================================================
+   RENDERITZA LA TAULA COMPLETA
+   ============================================================ */
+function renderNotesTable() {
+  try { _notesAmbPendents(); } catch (e) {}
+  const empty = document.getElementById('notesEmpty');
+  const wrap  = document.getElementById('notesTableWrap');
+  const thead = document.getElementById('notesTableHead');
+  const tbody = document.getElementById('notesTableBody');
+  thead.innerHTML = ''; tbody.innerHTML = '';
+
+  if (!notesItems.length) { empty.style.display='block'; wrap.style.display='none'; return; }
+  empty.style.display = 'none'; wrap.style.display = 'block';
+
+  // Capçalera
+  const trH = document.createElement('tr');
+  const thNom = document.createElement('th'); thNom.className='notes-th-name'; thNom.textContent='Alumne'; trH.appendChild(thNom);
+  notesItems.forEach(item => {
+    const th = document.createElement('th');
+    if (item.isActitud) {
+      th.className = 'notes-th-item notes-th-actitud';
+      th.innerHTML = `<div class="notes-th-item-nom special-col-nom" onclick="openActitudPanel()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+        ${escapeHtml(item.nom)}</div>
+        <div class="notes-th-item-meta">Pes ${item.pes} · clica per editar</div>`;
+    } else if (item.readonly) {
+      th.className = 'notes-th-item notes-th-carpeta';
+      th.innerHTML = `<div class="notes-th-item-nom special-col-nom">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+        ${escapeHtml(item.nom)}</div>
+        <div class="notes-th-item-meta">Pes ${item.pes} · automàtic</div>`;
+    } else {
+      th.className = 'notes-th-item';
+      th.innerHTML = `<button class="notes-del-btn" aria-label="Eliminar ${escapeHtml(item.nom)}" onclick="deleteNotaItem('${_idJs(item.id)}')" title="Eliminar ${escapeHtml(item.nom)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button><div class="notes-th-item-nom" title="${escapeHtml(item.nom)}">${escapeHtml(item.nom)}</div><div class="notes-th-item-meta">Pes ${item.pes} · sobre ${item.maxPunts}</div>`;
+    }
+    trH.appendChild(th);
+  });
+  const thM = document.createElement('th'); thM.className='notes-th-mitj';
+  thM.innerHTML='<div class="special-col-nom"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg> Mitjana</div><small>/10</small>';
+  trH.appendChild(thM);
+  const thN = document.createElement('th'); thN.className='notes-th-mitj';
+  thN.innerHTML='<div class="special-col-nom"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><polyline points="20 6 9 17 4 12"/></svg> Nota</div><small>arrodonida</small>';
+  trH.appendChild(thN);
+  thead.appendChild(trH);
+
+  // Files d'alumnes (DocumentFragment per evitar reflows múltiples)
+  const fragBody = document.createDocumentFragment();
+  students.forEach(s => {
+    const tr = document.createElement('tr');
+    // Nom
+    const tdNom = document.createElement('td'); tdNom.className='notes-td-name';
+    tdNom.innerHTML = `<div class="notes-td-name-inner"><div class="student-avatar" style="width:28px;height:28px;font-size:10px;flex-shrink:0">${getInitials(s.nom)}</div><span>${escapeHtml(typeof nomAlumne==='function'?nomAlumne(s):s.nom)}</span></div>`;
+    tr.appendChild(tdNom);
+
+    notesItems.forEach(item => {
+      const td = document.createElement('td'); td.className='notes-td-item';
+      const inner = document.createElement('div'); inner.className='notes-td-item-inner';
+      const val = (notesValors[item.id] || {})[s.id];
+
+      if (item.readonly) {
+        td.classList.add('notes-td-item-readonly');
+        const nota = (val !== '' && val !== null && val !== undefined) ? parseFloat(val) : null;
+        const q    = nota !== null ? getQual(nota) : null;
+        const chip = document.createElement('div');
+        chip.id = 'c_' + item.id + '_' + s.id;
+        chip.className = item.isActitud ? 'nota10-chip nota10-actitud' : 'nota10-chip nota10-carpeta';
+        chip.textContent = nota !== null ? nota.toFixed(2) : '—';
+        chip.style.background = q ? q.bg : '#EEEEEE'; chip.style.color = q ? q.color : 'var(--text-muted)';
+        // El nombre d'aspectes el tria cada mestre (Configuració > Aspectes d'actitud),
+        // així que no el podem donar per fet: el comptem.
+        chip.title = item.isActitud
+          ? 'Actitud (mitjana dels ' + ACTITUD_ASPECTES.length + ' aspectes) · clica per editar'
+          : 'Carpeta Viatgera (automàtic)';
+        if (item.isActitud) chip.style.cursor = 'pointer';
+        if (item.isActitud) chip.onclick = () => openActitudPanel();
+        inner.appendChild(chip);
+      } else {
+        const isNE = (noEntregats[item.id] || {})[s.id] === true;
+        const n    = isNE ? 0 : sobre10(val, item.maxPunts);
+        const q    = (n !== null && !isNE) ? getQual(n) : (isNE ? QUALS[0] : null);
+
+        const btnNE = document.createElement('button');
+        btnNE.className = 'ne-btn' + (isNE ? ' ne-active' : '');
+        btnNE.title     = isNE ? 'No Entregat — clica per desfer' : 'Marcar com a No Entregat';
+        btnNE.textContent = 'NE';
+
+        const inp = document.createElement('input');
+        inp.type='number'; inp.min='0'; inp.max=String(item.maxPunts); inp.step='0.5';
+        inp.className='notes-input-punts';
+        /* Qui fa servir un lector de pantalla sentia «casella de número» i
+           prou: ni de quin nen ni de quina activitat (QA del 27/9/2026). El
+           botó NE i les creus del registre ja ho deien. */
+        inp.setAttribute('aria-label', item.nom + ' — ' + s.nom);
+        /* ENTER BAIXA A L'ALUMNE SEGÜENT (i Shift+Enter puja). Passar les
+           notes amb el teclat demanava tres tabulacions per nen —la casella,
+           el botó NE i el del comentari—; amb Enter es va a la casella de la
+           mateixa columna del nen de sota, que és com es passen les notes de
+           debò. Les fletxes es deixen com estaven (pugen i baixen el número). */
+        inp.addEventListener('keydown', function (ev) {
+          if (ev.key !== 'Enter') return;
+          ev.preventDefault();
+          const totes = Array.prototype.slice.call(
+            document.querySelectorAll('#notesTableWrap input.notes-input-punts'));
+          const jo = totes.indexOf(inp);
+          if (jo === -1) return;
+          const cols = (typeof notesItems !== 'undefined')
+            ? notesItems.filter(function (x) { return !x.readonly; }).length : 1;
+          const seguent = ev.shiftKey ? jo - cols : jo + cols;
+          const on = totes[seguent];
+          if (on && !on.disabled) { on.focus(); if (on.select) on.select(); }
+        });
+        inp.value       = (!isNE && val !== undefined && val !== '') ? val : '';
+        inp.placeholder = isNE ? 'NE' : '—';
+        inp.disabled    = isNE;
+        if (isNE) inp.style.opacity = '0.4';
+
+        const chip = document.createElement('div');
+        chip.id = 'c_' + item.id + '_' + s.id; chip.className = 'nota10-chip';
+        if (isNE) {
+          chip.textContent = '0.00'; chip.style.background = '#FEE2E2'; chip.style.color = '#991B1B';
+        } else {
+          chip.textContent = n !== null ? n.toFixed(2) : '—';
+          chip.style.background = q ? q.bg : 'transparent'; chip.style.color = q ? q.color : 'var(--text-muted)';
+        }
+
+        btnNE.addEventListener('click', () => toggleNoEntregat(item, s.id, inp, chip));
+        let t;
+        inp.addEventListener('input', () => {
+          clearTimeout(t);
+          const v = parseFloat(inp.value.trim());
+          /* ⚠ També per sota de zero. Nomes es mirava el maxim, i un -5 entrava
+             tal qual al full com a nota, mitjana i nota arrodonida
+             (auditoria 6/9/2026). */
+          if (!isNaN(v) && v < 0) { inp.style.borderColor='#EF4444'; showToast('Una nota no pot ser negativa','error'); return; }
+          if (!isNaN(v) && v > item.maxPunts) { inp.style.borderColor='#EF4444'; showToast(`Màxim: ${item.maxPunts} punts`,'error'); return; }
+          inp.style.borderColor = '';
+          t = setTimeout(() => updateNota(item.id, s.id, inp.value.trim()==='' ? '' : v), 400);
+        });
+        inp.addEventListener('blur', () => {
+          const v = parseFloat(inp.value.trim());
+          if (!isNaN(v) && v < 0) { inp.value = 0; inp.style.borderColor=''; updateNota(item.id, s.id, 0); return; }
+          if (!isNaN(v) && v > item.maxPunts) { inp.value = item.maxPunts; inp.style.borderColor=''; updateNota(item.id, s.id, item.maxPunts); }
+        });
+
+        // Comentari d'aquest alumne sobre AQUESTA activitat
+        const txtCom = (notesComentaris[item.id] || {})[s.id] || '';
+        const btnCom = document.createElement('button');
+        btnCom.className = 'nota-com-btn' + (txtCom ? ' te-coment' : '');
+        btnCom.title = txtCom || 'Escriure un comentari sobre aquesta activitat';
+        btnCom.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">' +
+          '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
+        btnCom.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          obreComentariNota(item, s);
+        });
+
+        td.appendChild(btnNE);
+        td.appendChild(btnCom);
+        inner.appendChild(inp); inner.appendChild(chip);
+      }
+      td.appendChild(inner); tr.appendChild(td);
+    });
+
+    // Mitjana
+    const mitj = calcMitjana(s.id);
+    const tdM = document.createElement('td'); tdM.className='notes-td-mitj notes-td-item-readonly';
+    const divM = document.createElement('div'); divM.id='mitj_'+s.id; divM.className='mitj-cell';
+    const qM = mitj !== null ? getQual(mitj) : null;
+    divM.innerHTML = mitj !== null
+      ? `<span class="nota10-chip" style="background:${qM?qM.bg:'var(--surface-alt)'};color:${qM?qM.color:'var(--text-sub)'};font-size:15px;font-weight:700">${mitj.toFixed(2)}</span>`
+      : '<span style="color:var(--text-muted)">—</span>';
+    tdM.appendChild(divM); tr.appendChild(tdM);
+
+    // Nota arrodonida
+    const nota = arrod(mitj);
+    const tdN = document.createElement('td'); tdN.className='notes-td-mitj notes-td-item-readonly';
+    const divN = document.createElement('div'); divN.id='nota_'+s.id; divN.className='mitj-cell';
+    if (nota !== null) {
+      const isSus = nota < 5;
+      const bg    = isSus ? '#FEE2E2' : '#D1FAE5';
+      const fc    = isSus ? '#991B1B' : '#065F46';
+      const qual  = getQualCodi(nota);
+      divN.innerHTML = `<span class="nota10-chip" style="background:${bg};color:${fc};font-size:16px;font-weight:800;min-width:44px">${nota}</span><span class="qual-badge" style="background:${bg};color:${fc};font-size:11px">${qual}</span>`;
+    } else { divN.innerHTML = '<span style="color:var(--text-muted)">—</span>'; }
+    tdN.appendChild(divN); tr.appendChild(tdN);
+    fragBody.appendChild(tr);
+  });
+  tbody.appendChild(fragBody);
+}
+
+// Àlies per compatibilitat
+function loadNotes() { _loadNotesBackground(); }
+
+function _injectActitudItem(materia, trimestre) {
+  // Elimina l'actitud anterior si existia
+  notesItems = notesItems.filter(i => i.id !== 'actitud_ref');
+  // Afegeix l'ítem d'actitud amb els valors actuals del localStorage
+  const actItem = { id: 'actitud_ref', nom: 'Actitud', maxPunts: 10, pes: 2, readonly: true, isActitud: true };
+  notesItems.push(actItem);
+  notesValors['actitud_ref'] = notesValors['actitud_ref'] || {};
+  students.forEach(s => {
+    const dades = getActitud(materia, trimestre, s.id);
+    const mitj  = calcMitjanaActitud(dades);
+    notesValors['actitud_ref'][s.id] = mitj !== null ? mitj : '';
+  });
+}
+
+/* ============================================================
+   ACTITUD
+   5 aspectes × N alumnes × per assignatura × per trimestre
+   Clau localStorage: actitud_{materia}_{trimestre}_{studentId}
+   → { participacio, atencio, comportament, saberEstar, realitzacio }
+   La mitjana s'injecta com a columna readonly «Actitud» (pes 2)
+   entre Carpeta Viatgera i Mitjana.
+   ============================================================ */
+
+const ACTITUD_ASPECTES = [
+  { id: 'participacio',  nom: 'Participació' },
+  { id: 'atencio',       nom: 'Atenció' },
+  { id: 'comportament',  nom: 'Comportament' },
+  { id: 'saberEstar',    nom: 'Saber estar' },
+  { id: 'realitzacio',   nom: 'Realització activitats' },
+];
+
+/* ⚠ L'ACTITUD ANAVA INDEXADA PER POSICIÓ, NO PEL CODI DE L'ALUMNE.
+
+   Trobat al QA de l'11/9/2026. `s.id` és la posició dins la llista del grup,
+   no el codi permanent. Qualsevol cosa que canviï l'ordre o el nombre de
+   files amb nom —ordenar el grup, una fila que es queda sense nom, una
+   incorporació— reassignava la puntuació d'actitud de cada nen a un altre.
+   I l'actitud pesa 2 a la mitjana, o sigui que no és un detall.
+
+   Els assoliments es van arreglar el 6/9 amb `_assimSid`; a l'actitud no s'hi
+   va portar. Ara fa servir el mateix, i segueix llegint la clau vella si la
+   nova encara no hi és, per no perdre el que ja hi hagi apuntat. */
+function _actitudSid(studentId) {
+  return (typeof _assimSid === 'function') ? _assimSid(studentId) : studentId;
+}
+function _actitudKey(materia, trimestre, studentId) {
+  return `actitud_${materia}_${trimestre}_${_actitudSid(studentId)}`;
+}
+function _actitudKeyVella(materia, trimestre, studentId) {
+  return `actitud_${materia}_${trimestre}_${studentId}`;
+}
+
+function getActitud(materia, trimestre, studentId) {
+  const nova = _actitudKey(materia, trimestre, studentId);
+  let v = localStorage.getItem(nova);
+  if (v === null) {
+    // Encara amb la clau d'abans: es llegeix i es passa a la nova.
+    const vella = _actitudKeyVella(materia, trimestre, studentId);
+    v = localStorage.getItem(vella);
+    if (v !== null && vella !== nova) { try { localStorage.setItem(nova, v); } catch (e) {} }
+  }
+  return v ? JSON.parse(v) : {};
+}
+
+function setActitud(materia, trimestre, studentId, dades) {
+  localStorage.setItem(_actitudKey(materia, trimestre, studentId), JSON.stringify(dades));
+  if (typeof _actitudSaveToSheets === 'function') _actitudSaveToSheets(materia, trimestre);
+}
+
+function calcMitjanaActitud(dades) {
+  const vals = ACTITUD_ASPECTES.map(a => parseFloat(dades[a.id])).filter(v => !isNaN(v) && v >= 0);
+  if (!vals.length) return null;
+  return Math.round(vals.reduce((s,v) => s+v, 0) / vals.length * 100) / 100;
+}
+
+/* Quina actitud ja s ha demanat al full: evita el bucle del repintat. */
+let _actitudDemanat = null;
+
+/* Obre el panel d'actitud */
+function openActitudPanel() {
+  const { materia, trimestre } = notesContext;
+  if (!materia) return;
+
+  /* ⚠ L'actitud es desava al full i NO es tornava a llegir mai: la funció
+     `_actitudLoadFromSheets` estava escrita i no la cridava ningú. Vivia
+     només al navegador, o sigui que canviant d'ordinador —o buidant-lo—
+     desapareixia i la mitjana de l'alumne canviava sola (auditoria
+     6/9/2026). Es demana en obrir el panell i, quan arriba, es repinta.
+     El guard és perquè el repintat no torni a demanar-ho i entri en bucle. */
+  const _clauAct = materia + '_' + trimestre;
+  if (typeof _actitudLoadFromSheets === 'function' && _actitudDemanat !== _clauAct) {
+    _actitudDemanat = _clauAct;
+    _actitudLoadFromSheets(materia, trimestre).then(() => {
+      const obert = document.getElementById('actitudOverlay');
+      if (obert && obert.classList.contains('open')) {
+        try { openActitudPanel(); } catch (e) {}
+      }
+    }).catch(() => {});
+  }
+
+  document.getElementById('actitudTitle').textContent =
+    `Actitud · ${MATERIES[materia] || materia} · ${getTrimLabel(trimestre)}`;
+
+  // Construeix la taula
+  const wrap = document.getElementById('actitudTable');
+  let html = `<div class="actitud-table-wrap"><table class="actitud-table">
+    <thead><tr>
+      <th class="actitud-th-nom">Alumne</th>
+      ${ACTITUD_ASPECTES.map(a => `<th class="actitud-th-asp">${escapeHtml(a.nom)}</th>`).join('')}
+      <th class="actitud-th-mitj">Mitjana</th>
+    </tr></thead><tbody>`;
+
+  students.forEach(s => {
+    const dades = getActitud(materia, trimestre, s.id);
+    const mitj  = calcMitjanaActitud(dades);
+    const q     = mitj !== null ? getQual(mitj) : null;
+    html += `<tr>
+      <td class="actitud-td-nom">${escapeHtml(typeof nomAlumne==='function'?nomAlumne(s):s.nom)}</td>
+      ${ACTITUD_ASPECTES.map(a => {
+        const val = dades[a.id] !== undefined ? dades[a.id] : '';
+        return `<td class="actitud-td-inp">
+          <input class="actitud-input" type="number" min="1" max="10" step="0.5"
+            value="${val}" placeholder="—"
+            data-sid="${s.id}" data-asp="${a.id}"
+            oninput="onActitudInput(this)">
+        </td>`;
+      }).join('')}
+      <td class="actitud-td-mitj" id="actm_${s.id}">
+        ${mitj !== null ? `<span class="nota10-chip" style="background:${q?q.bg:'transparent'};color:${q?q.color:'var(--text-muted)'};">${mitj.toFixed(2)}</span>` : '<span style="color:var(--text-muted)">—</span>'}
+      </td>
+    </tr>`;
+  });
+
+  html += '</tbody></table></div>';
+  wrap.innerHTML = html;
+  document.getElementById('actitudOverlay').classList.add('open');
+}
+
+function closeActitudPanel() {
+  document.getElementById('actitudOverlay').classList.remove('open');
+}
+
+function onActitudInput(inp) {
+  const sid = parseInt(inp.dataset.sid);
+  const asp = inp.dataset.asp;
+  const val = parseFloat(inp.value);
+  /* ⚠ EL PANEL D ACTITUD ACCEPTAVA NUMEROS QUE NO SON NOTES.
+
+     Trobat a l auditoria del 6/9/2026: es podia escriure un negatiu; es
+     desava, i la mitjana l ignorava en silenci (filtra `v >= 0`). La casella
+     ja diu min=1 i max=10: aqui s hi ha de fer cas i no admetre res mes. */
+  if (!isNaN(val) && val > 10) { inp.value = 10; return; }
+  if (!isNaN(val) && val < 1 && inp.value !== '') { inp.value = 1; return; }
+
+  /* ⚠ LA MITJANA QUE ES VEIA MENTRE S'ESCRIVIA ERA FALSA.
+
+     Trobat a l'auditoria del 6/9/2026: es llegia el que hi ha DESAT i s'hi
+     afegia només l'aspecte que s'acabava de teclejar. Els altres que la
+     mestra havia escrit i encara no s'havien desat no comptaven, i el número
+     que veia no era el que li quedaria. Ara es llegeix el que hi ha ARA a la
+     pantalla, que és el que ella està mirant. */
+  const { materia, trimestre } = notesContext;
+  const dades = {};
+  document.querySelectorAll('#actitudTable input[data-sid="' + sid + '"]').forEach(x => {
+    const v = parseFloat(x.value);
+    if (x.value !== '' && !isNaN(v)) dades[x.dataset.asp] = v;
+  });
+  if (inp.value === '') delete dades[asp];
+  else if (!isNaN(val)) dades[asp] = val;
+
+  const mitj = calcMitjanaActitud(dades);
+  const q    = mitj !== null ? getQual(mitj) : null;
+  const cell = document.getElementById('actm_' + sid);
+  if (cell) cell.innerHTML = mitj !== null
+    ? `<span class="nota10-chip" style="background:${q?q.bg:'transparent'};color:${q?q.color:'var(--text-muted)'};">${mitj.toFixed(2)}</span>`
+    : '<span style="color:var(--text-muted)">—</span>';
+}
+
+function saveActitud() {
+  const { materia, trimestre } = notesContext;
+  // Recull tots els inputs i guarda
+  document.querySelectorAll('.actitud-input').forEach(inp => {
+    const sid = parseInt(inp.dataset.sid);
+    const asp = inp.dataset.asp;
+    let val = parseFloat(inp.value);
+    const dades = getActitud(materia, trimestre, sid);
+    /* El mateix sostre que a la casella: aqui es on de debo es desa, i un
+     valor fora de rang que hi arribes per un altre cami es quedaria al full. */
+    if (!isNaN(val)) val = Math.max(1, Math.min(10, val));
+    if (inp.value === '' || isNaN(val)) delete dades[asp];
+    else dades[asp] = val;
+    setActitud(materia, trimestre, sid, dades);
+  });
+
+  // Actualitza la columna d'actitud a la taula de notes
+  _updateActitudColumn();
+  // Sincronitza la mitjana d'actitud al servidor per cada alumne
+  _syncActitudToServer();
+  closeActitudPanel();
+  showToast('Actitud guardada', 'success');
+}
+
+async function _syncActitudToServer() {
+  if (!config.scriptUrl) return;
+  const { materia, trimestre } = notesContext;
+  /* El GRUP hi ha d anar: la pestanya de notes es diu «1T_Matematiques__2nc_2n C»
+     i sense el grup el servidor buscava «1T_Matematiques__2nc», que no existeix.
+     No la trobava, feia return ok i callava: l app deia que l alumne tenia un 6
+     i el full deia 10 (auditoria 6/9/2026). */
+  const grup = notesContext.grup || ((typeof _grupDeTreball === 'function') ? _grupDeTreball() : '') || '';
+  // Recull totes les mitjanes i les envia en UNA sola crida (batch)
+  const mitjanes = {};
+  /* El NOM de cada alumne va amb la seva mitjana: al full la fila la mana el
+     nom, no el número, perquè el full de l'escola es reordena sol (segona
+     auditoria, 8/9/2026). */
+  const noms = {};
+  students.forEach(s => {
+    const mitj = calcMitjanaActitud(getActitud(materia, trimestre, s.id));
+    if (mitj !== null) { mitjanes[s.id] = mitj; noms[s.id] = s.nom; }
+  });
+  if (!Object.keys(mitjanes).length) return;
+  try {
+    const r = await appsScriptPost({ action: 'updateActitudBatch', materia, trimestre, mitjanes, grup, noms });
+    if (r && r.avis) showToast(r.avis, 'error');
+  } catch(e) { /* silenci, ja està al localStorage */ }
+}
+
+/* Injecta/actualitza els valors d'actitud a notesValors i re-renderitza */
+function _updateActitudColumn() {
+  const { materia, trimestre } = notesContext;
+  const actItem = notesItems.find(i => i.id === 'actitud_ref');
+  if (!actItem) return;
+  students.forEach(s => {
+    const dades = getActitud(materia, trimestre, s.id);
+    const mitj  = calcMitjanaActitud(dades);
+    if (!notesValors[actItem.id]) notesValors[actItem.id] = {};
+    notesValors[actItem.id][s.id] = mitj !== null ? mitj : '';
+  });
+  renderNotesTable();
+}
