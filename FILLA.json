@@ -1,12 +1,12 @@
 {
   "mestra": "Marta Peraire",
-  "mareVersio": "v389",
+  "mareVersio": "v390",
   "propis": [
     "manifest.webmanifest",
     "manifest.json"
   ],
   "rol": "especialista",
-  "sincronitzat": "2026-11-24",
+  "sincronitzat": "2026-11-25",
   "fitxersMare": [
     ".gitignore",
     "CLAUDE.md",
